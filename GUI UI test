@@ -1,0 +1,393 @@
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Tên định danh ĐỘC NHẤT, không trùng GUI 1
+local GUI_NAME       = "KHANHLY_BlackFlash_GUI"
+local AIM_BIND_NAME  = "KHANHLY_BlackFlash_AimLock"
+
+-- ============================ CONFIG ============================
+local CONFIG = {
+    MaxDistance       = 13,
+    AimLockTime       = 1,
+    DashDuration      = 0.45,
+    PostDashWait      = 0.55,
+    SideOffsetBase    = 11,
+    SideOffsetScale   = 0.1,
+    BackOffset        = 4.8,
+    TargetLockForAim  = 50,
+}
+
+-- ============================ STATE ============================
+local State = {
+    Enabled            = false,
+    Busy               = false,
+    SideFlip           = false,
+    AimActive          = false,
+    SavedMouseBehavior = nil,
+    SavedCameraMode    = nil,
+    SavedAutoRotate    = nil,
+    AimEndTime         = 0,
+    Destroyed          = false,
+}
+
+-- Gom connection để cleanup sạch
+local Connections = {}
+local function track(conn)
+    table.insert(Connections, conn)
+    return conn
+end
+
+-- ============================ HELPERS ============================
+local function waitMs(ms)
+    local t0  = os.clock()
+    local dur = ms / 1000
+    while os.clock() - t0 < dur do
+        RunService.Heartbeat:Wait()
+    end
+end
+
+local function getMyRoot()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function findNearestTarget(maxDist)
+    local myRoot = getMyRoot()
+    if not myRoot then return nil end
+
+    local nearest, nearestDist = nil, maxDist
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if model:IsA("Model") and model ~= LocalPlayer.Character then
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local root = model:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local d = (root.Position - myRoot.Position).Magnitude
+                    if d <= nearestDist then
+                        nearest     = root
+                        nearestDist = d
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function findNearestPlayer(maxDist)
+    local myRoot = getMyRoot()
+    if not myRoot then return nil end
+
+    local nearest, nearestDist = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local root = plr.Character:FindFirstChild("HumanoidRootPart")
+            local hum  = plr.Character:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                local d = (myRoot.Position - root.Position).Magnitude
+                if d < nearestDist and d <= maxDist then
+                    nearest     = plr.Character
+                    nearestDist = d
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function faceTarget(targetChar)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    local hum    = char:FindFirstChildOfClass("Humanoid")
+    local tRoot  = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot or not tRoot then return end
+
+    if hum then hum.AutoRotate = false end
+    local p = tRoot.Position
+    myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(p.X, myRoot.Position.Y, p.Z))
+    myRoot.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- ========================= AIM LOCK =========================
+local function stopAimLock()
+    State.AimActive = false
+    pcall(function() RunService:UnbindFromRenderStep(AIM_BIND_NAME) end)
+
+    if State.SavedMouseBehavior ~= nil then
+        pcall(function() UserInputService.MouseBehavior = State.SavedMouseBehavior end)
+        State.SavedMouseBehavior = nil
+    end
+    if State.SavedCameraMode ~= nil then
+        pcall(function() LocalPlayer.CameraMode = State.SavedCameraMode end)
+        State.SavedCameraMode = nil
+    end
+
+    local char = LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and State.SavedAutoRotate ~= nil then
+        hum.AutoRotate = State.SavedAutoRotate
+    end
+    State.SavedAutoRotate = nil
+end
+
+local function startAimLock(duration)
+    stopAimLock()
+
+    State.AimActive  = true
+    State.AimEndTime = os.clock() + (duration or CONFIG.AimLockTime)
+
+    State.SavedMouseBehavior = UserInputService.MouseBehavior
+    State.SavedCameraMode    = LocalPlayer.CameraMode
+
+    local char = LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    State.SavedAutoRotate = hum and hum.AutoRotate or true
+    if hum then hum.AutoRotate = false end
+
+    pcall(function()
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        LocalPlayer.CameraMode         = Enum.CameraMode.Classic
+    end)
+
+    pcall(function() RunService:UnbindFromRenderStep(AIM_BIND_NAME) end)
+
+    RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value, function()
+        if State.Destroyed or not State.AimActive or os.clock() >= State.AimEndTime then
+            stopAimLock()
+            return
+        end
+        pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+        local target = findNearestPlayer(CONFIG.TargetLockForAim)
+        if target then
+            faceTarget(target)
+        end
+    end)
+end
+
+-- ==================== SKILL TRIGGER ====================
+local function triggerBlackFlashSkill()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+
+    for _, btn in ipairs(pg:GetDescendants()) do
+        if btn:IsA("TextButton") or btn:IsA("ImageButton") then
+            local nameLower = string.lower(btn.Name)
+            local textLower = btn:IsA("TextButton") and string.lower(btn.Text) or ""
+
+            local isSkill =
+                string.find(nameLower, "divergent") or
+                string.find(textLower, "divergent") or
+                string.find(nameLower, "move3")     or
+                string.find(nameLower, "skill3")
+
+            if isSkill then
+                if firesignal then
+                    firesignal(btn.Activated)
+                    firesignal(btn.MouseButton1Click)
+                    firesignal(btn.MouseButton1Down)
+                    firesignal(btn.MouseButton1Up)
+                end
+                break
+            end
+        end
+    end
+end
+
+-- ===================== DASH (BEZIER) =====================
+local function performDash(targetRoot, myHum, myRoot)
+    if not targetRoot or not targetRoot.Parent then return end
+    if not myRoot or not myRoot.Parent then return end
+
+    local startPos  = myRoot.Position
+    local endPos    = (targetRoot.CFrame * CFrame.new(0, 0, CONFIG.BackOffset)).Position
+    local targetPos = targetRoot.Position
+
+    State.SideFlip = not State.SideFlip
+    local sideSign = State.SideFlip and 1 or -1
+
+    local dir     = (targetPos - startPos).Unit
+    local sideVec = Vector3.new(-dir.Z, 0, dir.X)
+
+    local mid     = (startPos + endPos) / 2
+    local control = mid + sideVec * sideSign * (
+        CONFIG.SideOffsetBase + (targetPos - startPos).Magnitude * CONFIG.SideOffsetScale
+    )
+
+    local t0 = os.clock()
+    while os.clock() - t0 < CONFIG.DashDuration do
+        if State.Destroyed then break end
+        if not myRoot.Parent or not targetRoot.Parent then break end
+
+        local t = math.clamp((os.clock() - t0) / CONFIG.DashDuration, 0, 1)
+        local e = 1 - (1 - t) ^ 3
+
+        local pos =
+            (1 - e) ^ 2 * startPos +
+            2 * (1 - e) * e * control +
+            e ^ 2 * endPos
+
+        local tp = targetRoot.Position
+        myRoot.CFrame = CFrame.lookAt(pos, Vector3.new(tp.X, pos.Y, tp.Z))
+        myRoot.AssemblyAngularVelocity = Vector3.zero
+        if myHum then myHum.AutoRotate = false end
+
+        RunService.RenderStepped:Wait()
+    end
+end
+
+-- ===================== MAIN RUN =====================
+local function runBlackFlash()
+    if State.Destroyed or State.Busy then return end
+    State.Busy = true
+
+    task.spawn(function()
+        local char = LocalPlayer.Character
+        if not char or not char:FindFirstChild("HumanoidRootPart") then
+            State.Busy = false
+            return
+        end
+
+        local myRoot = char.HumanoidRootPart
+        local myHum  = char:FindFirstChildOfClass("Humanoid")
+
+        local targetRoot = findNearestTarget(CONFIG.MaxDistance)
+
+        startAimLock(CONFIG.AimLockTime)
+
+        if targetRoot and targetRoot.Parent then
+            local savedAutoRotate = myHum and myHum.AutoRotate or true
+            if myHum then myHum.AutoRotate = false end
+
+            task.spawn(function()
+                performDash(targetRoot, myHum, myRoot)
+                task.wait(CONFIG.PostDashWait)
+                if myHum then myHum.AutoRotate = savedAutoRotate end
+            end)
+
+            if UserInputService.TouchEnabled then
+                triggerBlackFlashSkill()
+                waitMs(300)
+                triggerBlackFlashSkill()
+            else
+                waitMs(80)
+                waitMs(220)
+                waitMs(140)
+            end
+        else
+            if UserInputService.TouchEnabled then
+                triggerBlackFlashSkill()
+                waitMs(300)
+                triggerBlackFlashSkill()
+            else
+                waitMs(80)
+                waitMs(220)
+                waitMs(140)
+            end
+        end
+
+        State.Busy = false
+    end)
+end
+
+-- ===================== FLOATING BUTTON =====================
+-- Xóa bản cũ nếu có (chỉ xóa đúng GUI này)
+local old = PlayerGui:FindFirstChild(GUI_NAME)
+if old then old:Destroy() end
+
+local floatGui = Instance.new("ScreenGui")
+floatGui.Name           = GUI_NAME
+floatGui.ResetOnSpawn   = false
+floatGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+floatGui.Enabled        = true
+floatGui.Parent         = PlayerGui
+
+local floatFrame = Instance.new("Frame")
+floatFrame.Size                   = UDim2.fromOffset(80, 80)
+floatFrame.Position               = UDim2.new(0.8, -40, 0.5, -40)
+floatFrame.BackgroundTransparency = 1
+floatFrame.Active                 = true
+floatFrame.Parent                 = floatGui
+
+local floatBtn = Instance.new("ImageButton")
+floatBtn.Size             = UDim2.fromScale(1, 1)
+floatBtn.BackgroundColor3 = Color3.fromRGB(25, 28, 33)
+floatBtn.Image            = "rbxassetid://91280544133255"
+floatBtn.ScaleType        = Enum.ScaleType.Crop
+floatBtn.Active           = true
+floatBtn.Parent           = floatFrame
+
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
+
+local dragging, dragStart, startPos, moved = false, nil, nil, false
+
+track(floatBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        moved     = false
+        dragStart = input.Position
+        startPos  = floatFrame.Position
+    end
+end))
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+       or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragStart
+        if delta.Magnitude > 6 then moved = true end
+        floatFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end))
+
+track(floatBtn.MouseButton1Click:Connect(function()
+    if not moved then runBlackFlash() end
+end))
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.Three then
+        runBlackFlash()
+    end
+end))
+
+-- ===================== CLEANUP / RETURN =====================
+local function Destroy()
+    if State.Destroyed then return end
+    State.Destroyed = true
+    State.Busy      = false
+
+    -- Dừng aim lock, trả lại state camera/mouse
+    pcall(stopAimLock)
+
+    -- Ngắt toàn bộ connection
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    Connections = {}
+
+    -- Xóa CHỈ ScreenGui của GUI 2
+    local g = PlayerGui:FindFirstChild(GUI_NAME)
+    if g then g:Destroy() end
+end
+
+return {
+    Destroy = Destroy,
+    Run     = runBlackFlash,
+    Name    = GUI_NAME,
+}
